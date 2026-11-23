@@ -30,24 +30,26 @@ st.set_page_config(
 )
 
 st.markdown("""
-<div style="
-background-color:#F3EEFA;
-border-radius:12px;
-padding:12px 0;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    gap:8px;
-    padding:4px 0 10px;
-">
-    <span style="
-        color:#008C95;
-        font-size:52px;
-        font-weight:700;
-    ">
-        Evo<span style="font-size:52px;">Pro</span>Trace
-    </span>
-    <span style="font-size:44px;">🧬</span>
+<div style="background:linear-gradient(135deg,#F3EEFA 0%,#E6F4F5 100%);border:1px solid #D9E2EC;border-radius:16px;padding:22px 28px;display:flex;align-items:center;justify-content:center;gap:26px;flex-wrap:wrap;margin-bottom:8px;">
+<svg width="110" height="96" viewBox="0 0 110 96" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#008C95"/><stop offset="1" stop-color="#5B8DEF"/></linearGradient>
+<linearGradient id="g2" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#8E6BBF"/><stop offset="1" stop-color="#C9B6E8"/></linearGradient>
+</defs>
+<path d="M10 62 C 22 22, 36 88, 52 52 S 80 20, 100 40" fill="none" stroke="url(#g2)" stroke-width="11" stroke-linecap="round" opacity="0.55"/>
+<path d="M10 54 C 22 14, 36 80, 52 44 S 80 12, 100 32" fill="none" stroke="url(#g1)" stroke-width="11" stroke-linecap="round"/>
+<circle cx="24" cy="84" r="5" fill="#8E6BBF"/><circle cx="56" cy="74" r="5" fill="#008C95"/>
+<circle cx="84" cy="70" r="5" fill="#5B8DEF"/><circle cx="100" cy="62" r="4" fill="#8E6BBF"/>
+</svg>
+<div style="text-align:left;">
+<div style="font-size:64px;font-weight:800;line-height:1.05;letter-spacing:-1px;color:#008C95;">Evo<span style="color:#5B3FA0;">Pro</span>Trace</div>
+<div style="font-size:19px;color:#4A5568;margin-top:6px;">Residue-level interaction maps, sequence conservation and 3D structure in one place</div>
+<div style="margin-top:10px;">
+<span style="background:#fff;border:1px solid #D9E2EC;border-radius:20px;padding:3px 12px;font-size:14px;color:#2D3748;margin-right:6px;">🧬 Interaction maps</span>
+<span style="background:#fff;border:1px solid #D9E2EC;border-radius:20px;padding:3px 12px;font-size:14px;color:#2D3748;margin-right:6px;">🔬 Conservation</span>
+<span style="background:#fff;border:1px solid #D9E2EC;border-radius:20px;padding:3px 12px;font-size:14px;color:#2D3748;">🧪 3D viewer</span>
+</div>
+</div>
 </div>
 """, unsafe_allow_html=True)
 
