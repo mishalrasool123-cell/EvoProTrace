@@ -3,6 +3,7 @@ import tempfile
 import subprocess
 import json
 import os
+import sys
 import zipfile
 from io import BytesIO
 
@@ -179,7 +180,7 @@ if st.button("Generate interaction map", type="primary"):
 
                     result = subprocess.run(
                         [
-                            "python",
+                            sys.executable,
                             script,
                             "--config",
                             config_path,
