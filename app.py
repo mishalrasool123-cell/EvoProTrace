@@ -3,7 +3,6 @@ import tempfile
 import subprocess
 import json
 import os
-import sys
 import zipfile
 from io import BytesIO
 
@@ -12,6 +11,8 @@ import numpy as np
 import py3Dmol
 import streamlit.components.v1 as components
 from scipy.spatial.distance import cdist
+
+from map_runner import MODES, make_label_table, run_map
 
 from msa_tools import (
     align_sequences,
@@ -55,10 +56,6 @@ padding:12px 0;
 # 1. UPLOAD PDB STRUCTURES
 # --------------------------------------------------
 
-# --------------------------------------------------
-# 1. UPLOAD PDB STRUCTURES
-# --------------------------------------------------
-
 st.subheader("1. Upload PDB structures")
 
 files = st.file_uploader(
@@ -67,21 +64,74 @@ files = st.file_uploader(
     accept_multiple_files=True
 )
 
+n_files = len(files) if files else 0
+
+if n_files:
+    st.caption(f"{n_files} structure(s) uploaded.")
+
 # --------------------------------------------------
-# 2. CONFIGURE PROTEIN CHAINS
+# 2. CHOOSE THE ANALYSIS
 # --------------------------------------------------
 
-st.subheader("2. Configure protein chains")
+st.subheader("2. Choose the analysis")
+
+mode_label = st.radio(
+    "What do you want to map?",
+    list(MODES.values()),
+    horizontal=True
+)
+
+mode = [key for key, text in MODES.items() if text == mode_label][0]
+
+chain2 = None
+name2 = None
+lig_resname = ""
+lig_chain = ""
+min_sep = 3
 
 col1, col2 = st.columns(2)
 
 with col1:
-    chain1 = st.text_input("First chain ID", "A").strip()
-    name1 = st.text_input("First protein name", "Nanobody")
+    chain1 = st.text_input(
+        "First chain ID" if mode == "pp" else "Protein chain ID",
+        "A"
+    ).strip()
+    name1 = st.text_input(
+        "First protein name" if mode == "pp" else "Protein name",
+        "Nanobody" if mode == "pp" else "Protein"
+    )
 
 with col2:
-    chain2 = st.text_input("Second chain ID", "B").strip()
-    name2 = st.text_input("Second protein name", "Target")
+    if mode == "pp":
+        chain2 = st.text_input("Second chain ID", "B").strip()
+        name2 = st.text_input("Second protein name", "Target")
+
+    elif mode == "ligand":
+        lig_resname = st.text_input(
+            "Ligand name in the PDB file (for example FMN)",
+            ""
+        ).strip().upper()
+        lig_chain = st.text_input(
+            "Ligand chain ID (optional)",
+            ""
+        ).strip()
+        name2 = lig_resname or "Ligand"
+
+    else:
+        min_sep = st.number_input(
+            "Ignore pairs that are closer than this in the sequence",
+            min_value=1,
+            max_value=50,
+            value=3,
+            help="Residues next to each other in the chain always touch. "
+                 "This hides those trivial pairs."
+        )
+
+if mode == "ligand":
+    st.caption(
+        "The ligand is read from HETATM lines. Columns of the map are "
+        "ligand atoms, matched by atom name across structures."
+    )
 
 # --------------------------------------------------
 # 3. INTERACTION SETTINGS
@@ -100,15 +150,101 @@ with col2:
     hydro = st.number_input("Hydrophobic (Å)", value=4.0)
 
 with col3:
+    pistack = st.number_input("Pi-stacking (Å)", value=5.0)
     contact = st.number_input("Contact (Å)", value=4.0)
+
+col1, col2 = st.columns(2)
+
+with col1:
     min_complexes = st.number_input(
         "Minimum complexes",
         min_value=1,
-        value=2
+        max_value=max(1, n_files),
+        value=max(1, n_files),
+        key=f"min_complexes_{n_files}",
+        help="A residue pair is drawn only if it is found in at least "
+             "this many structures. It follows the number of uploaded "
+             "files, and you can lower it."
+    )
+
+with col2:
+    require_contact = st.checkbox(
+        "Show a pair only if the residues also touch (contact cutoff)",
+        value=False
     )
 
 # --------------------------------------------------
-# 4. GENERATE INTERACTION MAP
+# 4. RESIDUE LABELS AND DOMAINS (OPTIONAL)
+# --------------------------------------------------
+
+st.subheader("4. Residue labels and domains (optional)")
+
+label_files = {}
+generated_downloads = []
+
+
+def get_labels(key, title, chain):
+    with st.expander(title):
+        label_up = st.file_uploader(
+            "Label table (CSV with residue_number, residue_name, "
+            "residue_label, domain)",
+            type=["csv"],
+            key=key + "_labels"
+        )
+        domain_up = st.file_uploader(
+            "or a domain table (CSV with Sub_Domain, Domain, "
+            "Start_Resid, End_Resid): labels are made for you",
+            type=["csv"],
+            key=key + "_domains"
+        )
+
+        if label_up is not None:
+            label_files[key] = (label_up.name, label_up.getvalue())
+
+        elif domain_up is not None:
+            pdb_bytes = files[0].getvalue() if files else None
+            handle, path = tempfile.mkstemp(suffix=".csv")
+            os.close(handle)
+            ok, message = make_label_table(
+                domain_up.getvalue(), pdb_bytes, chain, path
+            )
+            if ok:
+                with open(path, "rb") as f:
+                    data = f.read()
+                label_files[key] = ("labels.csv", data)
+                st.success(message)
+                generated_downloads.append((key, data))
+            else:
+                st.error(message)
+            os.remove(path)
+
+
+get_labels("side1", f"Labels for {name1 or 'first protein'}", chain1)
+
+if mode == "pp":
+    get_labels("side2", f"Labels for {name2 or 'second protein'}", chain2)
+
+use_labels_text = st.radio(
+    "Text on the map axes",
+    ["Domain labels (for example H1.3)", "Residue letter + number"],
+    horizontal=True
+)
+use_labels = (
+    "residue_label" if use_labels_text.startswith("Domain")
+    else "residue_number"
+)
+
+for key, data in generated_downloads:
+    st.download_button(
+        f"Download the made labels ({key})",
+        data=data,
+        file_name=f"labels_{key}.csv",
+        mime="text/csv",
+        key="dl_" + key
+    )
+
+# --------------------------------------------------
+# 5. GENERATE INTERACTION MAP
 # --------------------------------------------------
 
 if st.button("Generate interaction map", type="primary"):
@@ -116,130 +252,94 @@ if st.button("Generate interaction map", type="primary"):
     if not files:
         st.error("Please upload at least one PDB file.")
 
-    elif not chain1 or not chain2:
-        st.error("Please enter both chain IDs.")
+    elif not chain1:
+        st.error("Please enter the chain ID.")
 
-    elif chain1 == chain2:
-        st.error("Please use two different chain IDs.")
+    elif mode == "pp" and (not chain2 or chain1 == chain2):
+        st.error("Please enter two different chain IDs.")
+
+    elif mode == "ligand" and not lig_resname:
+        st.error("Please enter the ligand name (for example FMN).")
 
     else:
-        script = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "interaction_map.py"
+        side1 = {
+            "chain": chain1,
+            "name": name1,
+            "use_labels": use_labels
+        }
+
+        if mode == "pp":
+            side2 = {
+                "chain": chain2,
+                "name": name2,
+                "use_labels": use_labels
+            }
+        elif mode == "ligand":
+            side2 = {
+                "resname": lig_resname,
+                "chain": lig_chain,
+                "name": name2
+            }
+        else:
+            side2 = None
+
+        with st.spinner("Analyzing structures. Please wait..."):
+            st.session_state["map_result"] = run_map(
+                [(f.name, f.getvalue()) for f in files],
+                mode,
+                side1,
+                side2,
+                {
+                    "contact": contact,
+                    "hbond": hbond,
+                    "salt_bridge": salt,
+                    "pi_cation": picat,
+                    "hydrophobic": hydro,
+                    "pi_stacking": pistack
+                },
+                min_complexes,
+                min_sep=min_sep,
+                require_contact=require_contact,
+                label_files=label_files
+            )
+
+result = st.session_state.get("map_result")
+
+if result is not None:
+
+    if not result["ok"]:
+        st.error("Analysis could not be completed.")
+        st.code(result["error"])
+
+    else:
+        st.success("Analysis completed.")
+
+        if result["png"]:
+            st.subheader("Interaction map")
+            st.image(result["png"], use_container_width=True)
+        else:
+            st.warning(
+                "No map was generated. Lower the 'Minimum complexes' "
+                "setting, or check the chain IDs."
+            )
+
+        for filename in [
+            "interaction_pairs.csv",
+            "interaction_summary.csv"
+        ]:
+            if filename in result["tables"]:
+                st.subheader(filename)
+                st.dataframe(
+                    pd.read_csv(BytesIO(result["tables"][filename]))
+                )
+
+        st.download_button(
+            "Download all results (ZIP)",
+            data=result["zip"],
+            file_name="interaction_map_results.zip",
+            mime="application/zip"
         )
 
-        if not os.path.exists(script):
-            st.error("interaction_map.py was not found.")
-
-        else:
-            with st.spinner("Analyzing structures. Please wait..."):
-
-                with tempfile.TemporaryDirectory() as temp:
-
-                    structures = os.path.join(temp, "structures")
-                    output = os.path.join(temp, "results")
-
-                    os.makedirs(structures)
-
-                    for file in files:
-                        with open(
-                            os.path.join(structures, file.name), "wb"
-                        ) as f:
-                            f.write(file.getvalue())
-
-                    config = {
-                        "structures_dir": "structures",
-                        "file_pattern": "*.pdb",
-                        "ranking": None,
-                        "side1": {
-                            "chain": chain1,
-                            "name": name1,
-                            "labels": None
-                        },
-                        "side2": {
-                            "chain": chain2,
-                            "name": name2,
-                            "labels": None
-                        },
-                        "thresholds": {
-                            "contact": contact,
-                            "hbond": hbond,
-                            "salt_bridge": salt,
-                            "pi_cation": picat,
-                            "hydrophobic": hydro,
-                            "pi_stacking": 5.5
-                        },
-                        "min_complexes": int(min_complexes),
-                        "output_dir": "results"
-                    }
-
-                    config_path = os.path.join(temp, "config.json")
-
-                    with open(config_path, "w") as f:
-                        json.dump(config, f, indent=4)
-
-                    result = subprocess.run(
-                        [
-                            sys.executable,
-                            script,
-                            "--config",
-                            config_path,
-                            "--out",
-                            output
-                        ],
-                        capture_output=True,
-                        text=True
-                    )
-
-                    if result.returncode != 0:
-                        st.error("Analysis could not be completed.")
-                        st.code(result.stderr or result.stdout)
-
-                    elif os.path.exists(output):
-
-                        st.success("Analysis completed.")
-
-                        png = os.path.join(
-                            output, "interaction_map.png"
-                        )
-
-                        if os.path.exists(png):
-                            st.subheader("Interaction map")
-                            st.image(png, use_container_width=True)
-                        else:
-                            st.warning(
-                                "No map was generated. Check the "
-                                "minimum complexes setting."
-                            )
-
-                        for filename in [
-                            "interaction_pairs.csv",
-                            "interaction_summary.csv"
-                        ]:
-                            path = os.path.join(output, filename)
-
-                            if os.path.exists(path):
-                                st.subheader(filename)
-                                st.dataframe(pd.read_csv(path))
-
-                        memory_file = BytesIO()
-
-                        with zipfile.ZipFile(
-                            memory_file, "w", zipfile.ZIP_DEFLATED
-                        ) as archive:
-
-                            for filename in os.listdir(output):
-                                path = os.path.join(output, filename)
-
-                                if os.path.isfile(path):
-                                    archive.write(path, filename)
-
-                        st.download_button(
-                            "Download all results (ZIP)",
-                            data=memory_file.getvalue(),
-                            file_name="interaction_map_results.zip",
-                            mime="application/zip"
-                        )
 
 
 # --------------------------------------------------
@@ -373,7 +473,7 @@ if "msa" in st.session_state:
 # --------------------------------------------------
 
 st.divider()
-st.subheader("4. 3D Structure and Conservation Viewer")
+st.subheader("6. 3D Structure and Conservation Viewer")
 
 if files:
 
@@ -422,10 +522,10 @@ if files:
         0.1
     )
 
-    atoms = {
-        chain1: [],
-        chain2: []
-    }
+    atoms = {chain1: []}
+
+    if mode == "pp":
+        atoms[chain2] = []
 
     pdb_residues = []
     seen_residues = set()
@@ -526,10 +626,11 @@ if files:
         {"cartoon": {"color": "blue"}}
     )
 
-    viewer.setStyle(
-        {"chain": chain2},
-        {"cartoon": {"color": "orange"}}
-    )
+    if mode == "pp":
+        viewer.setStyle(
+            {"chain": chain2},
+            {"cartoon": {"color": "orange"}}
+        )
 
     # ----------------------------------------------
     # Color residues by conservation
@@ -562,7 +663,7 @@ if files:
     # Calculate protein-protein contacts
     # ----------------------------------------------
 
-    if atoms[chain1] and atoms[chain2]:
+    if mode == "pp" and atoms[chain1] and atoms[chain2]:
 
         coords1 = np.array(
             [a["xyz"] for a in atoms[chain1]]
@@ -698,10 +799,16 @@ if files:
                 "No highly conserved interacting residues were identified."
             )
 
-    else:
+    elif mode == "pp":
         st.warning(
             "Could not find atoms in both selected chains. "
             "Check the chain IDs."
+        )
+
+    else:
+        st.info(
+            "Contacts in the 3D viewer are shown for protein vs protein "
+            "only. The structure is shown without contact lines."
         )
 
     # ----------------------------------------------
