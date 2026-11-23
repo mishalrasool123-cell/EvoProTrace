@@ -43,11 +43,14 @@ SALT_CATION = {("LYS", "NZ"), ("ARG", "NE"),
 SALT_ANION = {("ASP", "OD1"), ("ASP", "OD2"),
               ("GLU", "OE1"), ("GLU", "OE2")}
 PICAT_CATION = {("LYS", "NZ"), ("ARG", "CZ")}
+# covalent radii (A): used to guess the bonds of a ligand from coordinates
+COV_RADIUS = {"C": 0.76, "N": 0.71, "O": 0.66, "S": 1.05, "P": 1.07,
+              "F": 0.57, "CL": 1.02, "BR": 1.20, "I": 1.39, "SE": 1.20}
 
 TYPES = ["hbond", "salt_bridge", "pi_cation", "hydrophobic"]
 DEFAULTS = {
     "contact": 4.0, "hbond": 3.5, "salt_bridge": 4.0,
-    "pi_cation": 6.0, "hydrophobic": 4.0, "pi_stacking": 5.5,
+    "pi_cation": 6.0, "hydrophobic": 4.0, "pi_stacking": 5.0,
 }
 # Offsets of the four small boxes inside one cell (y axis is inverted,
 # so (0, 0) is the top-left box).
@@ -86,6 +89,47 @@ def read_pdb(path, chains):
     return out
 
 
+def read_ligand(path, sel):
+    """Heavy atoms of ONE ligand from ATOM and HETATM records.
+
+    sel: {"resname": "LIG", "chain": "B" (optional), "resnum": 501 (optional)}
+    If several copies match, only the first copy is used.
+    """
+    want = sel.get("resname")
+    chain = sel.get("chain")
+    resnum = sel.get("resnum")
+    first, seen, atoms = None, set(), []
+    with open(path) as fh:
+        for line in fh:
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            if line[16] not in (" ", "A", "1"):
+                continue
+            res = line[17:20].strip()
+            if want and res != want:
+                continue
+            if chain and line[21] != chain:
+                continue
+            num = int(line[22:26])
+            if resnum is not None and num != int(resnum):
+                continue
+            key = (line[21], num)
+            if first is None:
+                first = key
+            if key != first:
+                continue
+            name = line[12:16].strip()
+            elem = line[76:78].strip().upper()
+            if not elem:
+                elem = name.lstrip("0123456789")[:1].upper()
+            if elem in ("H", "D") or name in seen:
+                continue
+            seen.add(name)
+            atoms.append((num, res, name, elem, float(line[30:38]),
+                          float(line[38:46]), float(line[46:54])))
+    return atoms
+
+
 class Side:
     """All atoms of one chain, as numpy arrays."""
 
@@ -104,7 +148,7 @@ class Side:
                          zip(self.res, self.name, self.elem)], dtype=bool)
 
     def rings(self):
-        """Ring centres of Phe, Tyr and Trp residues."""
+        """Ring centres of Phe, Tyr and Trp residues: ([residue], centre)."""
         out = []
         for n in sorted(set(self.num.tolist())):
             sel = self.num == n
@@ -113,8 +157,111 @@ class Side:
                 continue
             keep = np.isin(self.name[sel], RING[r])
             if keep.sum() >= 5:
-                out.append((n, self.xyz[sel][keep].mean(axis=0)))
+                out.append(([n], self.xyz[sel][keep].mean(axis=0)))
         return out
+
+    def anion_mask(self):
+        return self.mask(lambda r, n, e: (r, n) in SALT_ANION)
+
+    def cation_mask(self):
+        return self.mask(lambda r, n, e: (r, n) in SALT_CATION)
+
+    def picat_mask(self):
+        return self.mask(lambda r, n, e: (r, n) in PICAT_CATION)
+
+    def hyd_mask(self):
+        return self.mask(lambda r, n, e: r in APOLAR and e == "C"
+                         and n not in ("C", "CA"))
+
+
+class LigandSide(Side):
+    """Atoms of one ligand. Every atom is its own 'residue' (column).
+
+    Atoms get the same id in every structure because they are matched by
+    atom name (ids is shared between structures). Bonds are guessed from
+    distances. Charged groups, rings and hydrophobic carbons are found
+    with simple rules (see README, Limits).
+    """
+
+    def __init__(self, atoms, ids):
+        keyed = []
+        for a in atoms:
+            ids.setdefault(a[2], len(ids) + 1)
+            keyed.append((ids[a[2]], a[1], a[2], a[3], a[4], a[5], a[6]))
+        super().__init__(keyed)
+        self.resname = {a[0]: a[2] for a in keyed}   # id -> atom name
+        n = len(self.elem)
+        rad = np.array([COV_RADIUS.get(str(e), 0.8) for e in self.elem])
+        dist = cdist(self.xyz, self.xyz)
+        bonded = (dist < rad[:, None] + rad[None, :] + 0.45) & (dist > 0.4)
+        self.neigh = [list(np.where(bonded[i])[0]) for i in range(n)]
+        el = [str(e) for e in self.elem]
+        terminal_o = {i for i in range(n)
+                      if el[i] == "O" and len(self.neigh[i]) == 1}
+        self._anion = np.zeros(n, dtype=bool)
+        self._cation = np.zeros(n, dtype=bool)
+        self._hyd = np.zeros(n, dtype=bool)
+        for i in range(n):
+            nb = self.neigh[i]
+            t_o = [j for j in nb if j in terminal_o]
+            if el[i] == "C" and len(nb) == 3 and len(t_o) == 2:
+                self._anion[t_o] = True            # carboxylate
+            elif el[i] == "P" and len(t_o) >= 2:
+                self._anion[t_o] = True            # phosphate
+            elif el[i] == "S" and len(t_o) >= 3:
+                self._anion[t_o] = True            # sulfonate, sulfate
+            if el[i] == "C" and len(nb) == 3 and \
+                    all(el[j] == "N" for j in nb):
+                self._cation[nb] = True            # guanidinium
+            if el[i] == "N" and len(nb) == 4:
+                self._cation[i] = True             # quaternary N
+            if el[i] == "C" and nb and all(el[j] == "C" for j in nb):
+                self._hyd[i] = True                # carbon with C neighbours
+        self._rings = self._find_rings(el)
+
+    def _find_rings(self, el):
+        found, rings = set(), []
+
+        def walk(start, cur, path):
+            for nxt in self.neigh[cur]:
+                if nxt == start and len(path) >= 5:
+                    key = frozenset(path)
+                    if key not in found:
+                        found.add(key)
+                        rings.append(list(path))
+                elif nxt > start and nxt not in path and len(path) < 6:
+                    walk(start, nxt, path + [nxt])
+
+        for start in range(len(el)):
+            walk(start, start, [start])
+        out = []
+        for idx in rings:
+            if any(el[i] not in ("C", "N", "O", "S") for i in idx):
+                continue
+            if len(idx) == 6 and any(el[i] not in ("C", "N") for i in idx):
+                continue
+            pts = self.xyz[idx]
+            centre = pts.mean(axis=0)
+            normal = np.linalg.svd(pts - centre)[2][2]
+            if np.abs((pts - centre) @ normal).max() > 0.15:
+                continue                            # not flat: skip
+            out.append(([int(self.num[i]) for i in idx], centre))
+        return out
+
+    def rings(self):
+        return self._rings
+
+    def anion_mask(self):
+        return self._anion
+
+    def cation_mask(self):
+        return self._cation
+
+    def picat_mask(self):
+        return self._cation
+
+    def hyd_mask(self):
+        return self._hyd
 
 
 def near(a_xyz, a_num, b_xyz, b_num, cutoff):
@@ -135,7 +282,8 @@ def ring_pairs(ra, rb, cutoff):
     xa = np.array([c for _, c in ra])
     xb = np.array([c for _, c in rb])
     i, j = np.where(cdist(xa, xb) <= cutoff)
-    return {(ra[a][0], rb[b][0]) for a, b in zip(i, j)}
+    return {(u, v) for a, b in zip(i, j)
+            for u in ra[a][0] for v in rb[b][0]}
 
 
 def ring_vs_atoms(rings, side, mask, cutoff):
@@ -145,7 +293,8 @@ def ring_vs_atoms(rings, side, mask, cutoff):
     rc = np.array([c for _, c in rings])
     i, j = np.where(cdist(rc, side.xyz[mask]) <= cutoff)
     nums = side.num[mask]
-    return {(rings[a][0], int(nums[b])) for a, b in zip(i, j)}
+    return {(u, int(nums[b])) for a, b in zip(i, j)
+            for u in rings[a][0]}
 
 
 def measure(s1, s2, th, require_contact):
@@ -162,10 +311,8 @@ def measure(s1, s2, th, require_contact):
     add(near(*sub(s1, m1), *sub(s2, m2), th["hbond"]), "hbond")
 
     # salt bridges: charged atoms of opposite sign
-    def pick(side, table):
-        return side.mask(lambda r, n, e: (r, n) in table)
-    c1, a1 = pick(s1, SALT_CATION), pick(s1, SALT_ANION)
-    c2, a2 = pick(s2, SALT_CATION), pick(s2, SALT_ANION)
+    c1, a1 = s1.cation_mask(), s1.anion_mask()
+    c2, a2 = s2.cation_mask(), s2.anion_mask()
     add(near(*sub(s1, c1), *sub(s2, a2), th["salt_bridge"]),
         "salt_bridge")
     add(near(*sub(s1, a1), *sub(s2, c2), th["salt_bridge"]),
@@ -173,16 +320,14 @@ def measure(s1, s2, th, require_contact):
 
     # pi-cation: ring centre near Lys NZ or Arg CZ of the other side
     r1, r2 = s1.rings(), s2.rings()
-    p1, p2 = pick(s1, PICAT_CATION), pick(s2, PICAT_CATION)
+    p1, p2 = s1.picat_mask(), s2.picat_mask()
     add(ring_vs_atoms(r1, s2, p2, th["pi_cation"]), "pi_cation")
     add({(b, a) for a, b in ring_vs_atoms(r2, s1, p1, th["pi_cation"])},
         "pi_cation")
 
     # hydrophobic: side-chain carbons of apolar residues,
     # plus ring centre to ring centre (pi-stacking)
-    def hyd(r, n, e):
-        return r in APOLAR and e == "C" and n not in ("C", "CA")
-    h1, h2 = s1.mask(hyd), s2.mask(hyd)
+    h1, h2 = s1.hyd_mask(), s2.hyd_mask()
     add(near(*sub(s1, h1), *sub(s2, h2), th["hydrophobic"]),
         "hydrophobic")
     add(ring_pairs(r1, r2, th["pi_stacking"]), "hydrophobic")
@@ -205,7 +350,9 @@ def load_labels(path):
     lab, dom = {}, {}
     for row in df.itertuples(index=False):
         n = int(row.residue_number)
-        label = getattr(row, "label", "")
+        label = getattr(row, "residue_label", None)
+        if label is None:
+            label = getattr(row, "label", "")
         domain = getattr(row, "domain", "")
         lab[n] = "" if pd.isna(label) else str(label)
         dom[n] = "" if pd.isna(domain) else str(domain)
@@ -240,22 +387,50 @@ def choose_files(cfg, base):
     return chosen
 
 
+def intra_filter(found, min_sep):
+    """One chain against itself: drop close neighbours, count each
+    unordered residue pair once and merge its interaction types."""
+    out = {}
+    for (a, b), kinds in found.items():
+        if abs(a - b) < min_sep:
+            continue
+        out.setdefault((min(a, b), max(a, b)), set()).update(kinds)
+    return out
+
+
 def run_measurements(files, cfg, th):
-    c1, c2 = cfg["side1"]["chain"], cfg["side2"]["chain"]
+    c1 = cfg["side1"]["chain"]
+    lig = cfg["side2"].get("ligand")
+    c2 = None if lig else cfg["side2"]["chain"]
+    intra = (not lig) and c1 == c2
+    if lig and not (lig.get("resname") or lig.get("chain")):
+        sys.exit("side2.ligand needs a resname or a chain.")
+    lig_ids = {}                     # ligand atom name -> column id
+    min_sep = int(cfg.get("min_sequence_separation", 3))
     rows, names1, names2 = [], {}, {}
     used = []
     for path in files:
         sid = os.path.basename(path).rsplit(".", 1)[0]
-        atoms = read_pdb(path, [c1, c2])
-        if not atoms[c1] or not atoms[c2]:
-            print("  skipped (chain missing):", sid)
-            continue
-        s1, s2 = Side(atoms[c1]), Side(atoms[c2])
+        if lig:
+            atoms = read_pdb(path, [c1])
+            lig_atoms = read_ligand(path, lig)
+            if not atoms[c1] or not lig_atoms:
+                print("  skipped (chain or ligand missing):", sid)
+                continue
+            s1, s2 = Side(atoms[c1]), LigandSide(lig_atoms, lig_ids)
+        else:
+            atoms = read_pdb(path, [c1, c2])
+            if not atoms[c1] or not atoms[c2]:
+                print("  skipped (chain missing):", sid)
+                continue
+            s1, s2 = Side(atoms[c1]), Side(atoms[c2])
         for n, r in s1.resname.items():
             names1.setdefault(n, []).append(r)
         for n, r in s2.resname.items():
             names2.setdefault(n, []).append(r)
         found = measure(s1, s2, th, cfg.get("require_contact", False))
+        if intra:
+            found = intra_filter(found, min_sep)
         for (n1, n2), kinds in sorted(found.items()):
             row = {"structure": sid,
                    "side1_number": n1, "side1_residue": s1.resname[n1],
@@ -323,7 +498,9 @@ def draw(summ, names1, names2, lab1, dom1, lab2, dom2, cfg,
         return text + (" | " + lab[n] if lab.get(n) else "")
 
     ytick = [tick(n, names1, lab1) for n in rows]
-    xtick = [tick(n, names2, lab2) for n in cols]
+    is_lig = bool(cfg["side2"].get("ligand"))
+    xtick = [common(names2, n) if is_lig else tick(n, names2, lab2)
+             for n in cols]
     d1 = [dom1.get(n, "") for n in rows]
     d2 = [dom2.get(n, "") for n in cols]
     has_left = any(d1)
@@ -331,17 +508,30 @@ def draw(summ, names1, names2, lab1, dom1, lab2, dom2, cfg,
 
     sw = 1.5 if has_left else 0.0
     sh = 1.2 if has_top else 0.0
-    fig_w = max(6.0, 0.55 * len(cols) + 4.5)
-    fig_h = max(4.0, 0.5 * len(rows) + 4.0)
+    # cell size: 0.55 in for small maps, shrinks so big maps stay <= ~30 in
+    cell_w = min(0.55, max(0.12, 24.0 / max(len(cols), 1)))
+    cell_h = min(0.50, max(0.12, 24.0 / max(len(rows), 1)))
+    fig_w = max(6.0, cell_w * len(cols) + 4.5)
+    fig_h = max(4.0, cell_h * len(rows) + 4.0)
+    big = max(len(rows), len(cols))
+    tick_size = 8 if big <= 40 else max(3.0, 8 * 40.0 / big)
+    show_counts = min(cell_w, cell_h) >= 0.25
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     cmaps = {k: plt.get_cmap(v) for k, v in CMAPS.items()}
 
-    for r in range(len(rows)):
-        for c in range(len(cols)):
-            for k in TYPES:
-                dx, dy = OFFSETS[k]
-                ax.add_patch(Rectangle((c + dx, r + dy), 0.5, 0.5,
-                                       fc=EMPTY, ec="white", lw=0.8))
+    # grey background + white grid lines (fast, also for big maps)
+    ax.add_patch(Rectangle((0, 0), len(cols), len(rows),
+                           fc=EMPTY, ec="none"))
+    ax.vlines(np.arange(0, len(cols) + 0.01, 0.5), 0, len(rows),
+              color="white", lw=0.8, zorder=2)
+    ax.hlines(np.arange(0, len(rows) + 0.01, 0.5), 0, len(cols),
+              color="white", lw=0.8, zorder=2)
+    # dark lines around every residue pair (its block of four boxes)
+    pair_lw = 1.0 if big <= 40 else (0.6 if big <= 80 else 0.3)
+    ax.vlines(np.arange(0, len(cols) + 0.01, 1.0), 0, len(rows),
+              color="#333333", lw=pair_lw, zorder=3, clip_on=False)
+    ax.hlines(np.arange(0, len(rows) + 0.01, 1.0), 0, len(cols),
+              color="#333333", lw=pair_lw, zorder=3, clip_on=False)
     for row in keep.itertuples(index=False):
         r, c = ri[row.side1_number], ci[row.side2_number]
         for k in TYPES:
@@ -353,9 +543,10 @@ def draw(summ, names1, names2, lab1, dom1, lab2, dom2, cfg,
             ax.add_patch(Rectangle(
                 (c + dx, r + dy), 0.5, 0.5,
                 fc=cmaps[k](0.30 + 0.45 * frac), ec="white", lw=0.8))
-            ax.text(c + dx + 0.25, r + dy + 0.25, str(count),
-                    ha="center", va="center", fontsize=6,
-                    color="white" if frac >= 0.4 else "black")
+            if show_counts:
+                ax.text(c + dx + 0.25, r + dy + 0.25, str(count),
+                        ha="center", va="center", fontsize=6,
+                        color="white" if frac >= 0.4 else "black")
 
     table = {}
     if has_left:
@@ -378,14 +569,14 @@ def draw(summ, names1, names2, lab1, dom1, lab2, dom2, cfg,
     ax.set_xlim(-sw, len(cols))
     ax.set_ylim(len(rows), -sh)
     ax.set_xticks(np.arange(len(cols)) + 0.5)
-    ax.set_xticklabels(xtick, rotation=90, fontsize=8)
+    ax.set_xticklabels(xtick, rotation=90, fontsize=tick_size)
     ax.set_yticks(np.arange(len(rows)) + 0.5)
-    ax.set_yticklabels(ytick, fontsize=8)
+    ax.set_yticklabels(ytick, fontsize=tick_size)
     ax.tick_params(length=0)
     for s in ax.spines.values():
         s.set_visible(False)
-    ax.set_xlabel(cfg["side2"].get("name", "Side 2") + " residue",
-                  fontsize=10)
+    ax.set_xlabel(cfg["side2"].get("name", "Side 2")
+                  + (" atom" if is_lig else " residue"), fontsize=10)
     ylabel = cfg["side1"].get("name", "Side 1") + " residue"
     if any(lab1.values()):
         ylabel += " | numbering label"
@@ -406,7 +597,7 @@ def draw(summ, names1, names2, lab1, dom1, lab2, dom2, cfg,
     fig.legend(handles=handles, loc="lower center", ncol=3,
                frameon=False, fontsize=8)
     fig.tight_layout(rect=(0, 0.08, 1, 1))
-    fig.savefig(out_png, dpi=200)
+    fig.savefig(out_png, dpi=200 if big <= 60 else 120)
     fig.savefig(out_svg)
     plt.close(fig)
     return True
@@ -423,6 +614,10 @@ def main():
     base = os.path.dirname(cfg_path)
     with open(cfg_path) as fh:
         cfg = json.load(fh)
+    if "side2" not in cfg:           # one chain only: intra-protein map
+        cfg["side2"] = dict(cfg["side1"])
+    intra = (not cfg["side2"].get("ligand")) and \
+        cfg["side1"]["chain"] == cfg["side2"].get("chain")
     out = args.out or cfg.get("output_dir", "results")
     out = out if os.path.isabs(out) else os.path.join(base, out)
     os.makedirs(out, exist_ok=True)
@@ -441,15 +636,37 @@ def main():
     summ = summarize(pairs)
 
     def lab_path(side):
-        p = cfg[side].get("labels")
+        p = cfg[side].get("residue_labels") or cfg[side].get("labels")
         return os.path.join(base, p) if p else None
+
+    def label_mode(side):
+        mode = cfg[side].get("use_labels")
+        if mode is None:
+            mode = "residue_label" if lab_path(side) else "residue_number"
+        if mode not in ("residue_label", "residue_number"):
+            sys.exit("%s: use_labels must be 'residue_label' or "
+                     "'residue_number', not '%s'." % (side, mode))
+        return mode
 
     lab1, dom1 = load_labels(lab_path("side1"))
     lab2, dom2 = load_labels(lab_path("side2"))
+    # use_labels = residue_number: axis shows letter + number only
+    # (domain strips from the label file are still drawn)
+    if label_mode("side1") == "residue_number":
+        lab1 = {}
+    if label_mode("side2") == "residue_number":
+        lab2 = {}
+    if intra:                        # both axes are the same chain
+        lab2, dom2 = lab1, dom1
 
     pairs.to_csv(os.path.join(out, "interaction_pairs.csv"), index=False)
     summ.to_csv(os.path.join(out, "interaction_summary.csv"), index=False)
-    ok = draw(summ, names1, names2, lab1, dom1, lab2, dom2, cfg,
+    plot = summ
+    if intra:                        # symmetric square for drawing
+        mirror = summ.rename(columns={"side1_number": "side2_number",
+                                      "side2_number": "side1_number"})
+        plot = pd.concat([summ, mirror], ignore_index=True)
+    ok = draw(plot, names1, names2, lab1, dom1, lab2, dom2, cfg,
               len(used), os.path.join(out, "interaction_map.png"),
               os.path.join(out, "interaction_map.svg"))
 
