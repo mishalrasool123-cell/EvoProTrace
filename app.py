@@ -12,7 +12,7 @@ import py3Dmol
 import streamlit.components.v1 as components
 from scipy.spatial.distance import cdist
 
-from map_runner import MODES, make_label_table, run_map
+from map_runner import MODES, find_ligands, make_label_table, run_map
 
 from msa_tools import (
     align_sequences,
@@ -109,10 +109,27 @@ with col2:
         name2 = st.text_input("Second protein name", "Target")
 
     elif mode == "ligand":
-        lig_resname = st.text_input(
-            "Ligand name in the PDB file (for example FMN)",
-            ""
-        ).strip().upper()
+        found = find_ligands(
+            [(f.name, f.getvalue()) for f in files]
+        ) if files else {}
+
+        if found:
+            options = [
+                f"{code}  ({info['atoms']} atoms, in "
+                f"{info['files']} of {n_files} files)"
+                for code, info in found.items()
+            ]
+            choice = st.selectbox(
+                "Ligand found in your files",
+                options
+            )
+            lig_resname = choice.split()[0]
+        else:
+            st.caption("No small molecule (HETATM) was found in the files.")
+            lig_resname = st.text_input(
+                "Ligand name in the PDB file (for example FMN)",
+                ""
+            ).strip().upper()
         lig_chain = st.text_input(
             "Ligand chain ID (optional)",
             ""
