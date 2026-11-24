@@ -26,6 +26,29 @@ DEFAULT_THRESHOLDS = {
     "hydrophobic": 4.0,
     "pi_stacking": 5.0,
 }
+WATER = {"HOH", "WAT", "H2O", "DOD", "TIP", "SOL"}
+
+
+def find_ligands(structures):
+    """List the small molecules (HETATM) found in the uploaded files.
+    structures: list of (file name, bytes).
+    Returns {code: {"atoms": most atoms in one file, "files": number of
+    files that contain it}}, most common first. Water is skipped."""
+    found = {}
+    for _, data in structures:
+        counts = {}
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            if line.startswith("HETATM"):
+                code = line[17:20].strip()
+                if code and code not in WATER:
+                    counts[code] = counts.get(code, 0) + 1
+        for code, n in counts.items():
+            info = found.setdefault(code, {"atoms": 0, "files": 0})
+            info["atoms"] = max(info["atoms"], n)
+            info["files"] += 1
+    return dict(sorted(found.items(),
+                       key=lambda kv: (-kv[1]["files"], -kv[1]["atoms"],
+                                       kv[0])))
 
 
 def make_label_table(domain_bytes, pdb_bytes, chain, out_path):
