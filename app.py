@@ -179,6 +179,26 @@ with col2:
 # 4. RESIDUE LABELS AND DOMAINS (OPTIONAL)
 # --------------------------------------------------
 
+col1, col2 = st.columns(2)
+
+with col1:
+    pistack_angle = st.number_input(
+        "Pi-stacking angle limit (degrees, 0 = off)",
+        min_value=0.0,
+        max_value=90.0,
+        value=30.0,
+        help="Rings count as stacked only if their flat faces are "
+             "parallel (tilt up to this value) or, if the box on the "
+             "right is ticked, T-shaped (tilt of 90 minus this value "
+             "or more)."
+    )
+
+with col2:
+    pistack_tshape = st.checkbox(
+        "Also count T-shaped (perpendicular) rings",
+        value=True
+    )
+
 st.subheader("4. Residue labels and domains (optional)")
 
 label_files = {}
@@ -297,7 +317,11 @@ if st.button("Generate interaction map", type="primary"):
                     "salt_bridge": salt,
                     "pi_cation": picat,
                     "hydrophobic": hydro,
-                    "pi_stacking": pistack
+                    "pi_stacking": pistack,
+                    "pi_stacking_angle": (
+                        pistack_angle if pistack_angle > 0 else None
+                    ),
+                    "pi_stacking_t_shaped": pistack_tshape
                 },
                 min_complexes,
                 min_sep=min_sep,
