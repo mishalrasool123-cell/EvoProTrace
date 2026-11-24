@@ -51,6 +51,8 @@ TYPES = ["hbond", "salt_bridge", "pi_cation", "hydrophobic"]
 DEFAULTS = {
     "contact": 4.0, "hbond": 3.5, "salt_bridge": 4.0,
     "pi_cation": 6.0, "hydrophobic": 4.0, "pi_stacking": 5.0,
+    "pi_stacking_angle": 30.0,   # max tilt from parallel/perpendicular; None = off
+    "pi_stacking_t_shaped": True,   # also accept T-shaped (perpendicular) rings
 }
 # Offsets of the four small boxes inside one cell (y axis is inverted,
 # so (0, 0) is the top-left box).
@@ -148,7 +150,7 @@ class Side:
                          zip(self.res, self.name, self.elem)], dtype=bool)
 
     def rings(self):
-        """Ring centres of Phe, Tyr and Trp residues: ([residue], centre)."""
+        """Phe, Tyr and Trp rings: ([residue], centre, plane normal)."""
         out = []
         for n in sorted(set(self.num.tolist())):
             sel = self.num == n
@@ -157,7 +159,10 @@ class Side:
                 continue
             keep = np.isin(self.name[sel], RING[r])
             if keep.sum() >= 5:
-                out.append(([n], self.xyz[sel][keep].mean(axis=0)))
+                pts = self.xyz[sel][keep]
+                centre = pts.mean(axis=0)
+                normal = np.linalg.svd(pts - centre)[2][2]
+                out.append(([n], centre, normal))
         return out
 
     def anion_mask(self):
@@ -245,7 +250,7 @@ class LigandSide(Side):
             normal = np.linalg.svd(pts - centre)[2][2]
             if np.abs((pts - centre) @ normal).max() > 0.15:
                 continue                            # not flat: skip
-            out.append(([int(self.num[i]) for i in idx], centre))
+            out.append(([int(self.num[i]) for i in idx], centre, normal))
         return out
 
     def rings(self):
@@ -276,21 +281,38 @@ def sub(side, mask):
     return side.xyz[mask], side.num[mask]
 
 
-def ring_pairs(ra, rb, cutoff):
+def ring_angle(na, nb):
+    """Tilt between two ring planes in degrees (0 = parallel)."""
+    cos = abs(float(np.dot(na, nb)))
+    return float(np.degrees(np.arccos(min(1.0, cos))))
+
+
+def ring_pairs(ra, rb, cutoff, max_angle=None, t_shaped=True):
+    """Ring pairs whose centres are within cutoff. If max_angle is set,
+    the planes must be parallel (tilt <= max_angle degrees) or, when
+    t_shaped is True, perpendicular (tilt >= 90 - max_angle degrees)."""
     if not ra or not rb:
         return set()
-    xa = np.array([c for _, c in ra])
-    xb = np.array([c for _, c in rb])
+    xa = np.array([r[1] for r in ra])
+    xb = np.array([r[1] for r in rb])
     i, j = np.where(cdist(xa, xb) <= cutoff)
-    return {(u, v) for a, b in zip(i, j)
-            for u in ra[a][0] for v in rb[b][0]}
+    out = set()
+    for a, b in zip(i, j):
+        if max_angle:
+            tilt = ring_angle(ra[a][2], rb[b][2])
+            parallel = tilt <= max_angle
+            perpendicular = t_shaped and tilt >= 90.0 - max_angle
+            if not (parallel or perpendicular):
+                continue
+        out.update((u, v) for u in ra[a][0] for v in rb[b][0])
+    return out
 
 
 def ring_vs_atoms(rings, side, mask, cutoff):
     """Ring centre of one side versus selected atoms of the other."""
     if not rings or not mask.any():
         return set()
-    rc = np.array([c for _, c in rings])
+    rc = np.array([r[1] for r in rings])
     i, j = np.where(cdist(rc, side.xyz[mask]) <= cutoff)
     nums = side.num[mask]
     return {(u, int(nums[b])) for a, b in zip(i, j)
@@ -330,7 +352,9 @@ def measure(s1, s2, th, require_contact):
     h1, h2 = s1.hyd_mask(), s2.hyd_mask()
     add(near(*sub(s1, h1), *sub(s2, h2), th["hydrophobic"]),
         "hydrophobic")
-    add(ring_pairs(r1, r2, th["pi_stacking"]), "hydrophobic")
+    add(ring_pairs(r1, r2, th["pi_stacking"], th.get("pi_stacking_angle"),
+                   th.get("pi_stacking_t_shaped", True)),
+        "hydrophobic")
 
     if require_contact:
         ok = near(s1.xyz, s1.num, s2.xyz, s2.num, th["contact"])
